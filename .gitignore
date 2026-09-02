@@ -1,0 +1,28 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Environment variables & local secrets
+.env
+.env.local
+
+# Generated Meesho Session JSONs (keep local / cloud persistent)
+session_*.json
+last_otp_request.json
+created_meesho_accounts.json
+
+# Logs
+*.log
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
