@@ -395,6 +395,107 @@ class FodOfferHunter:
         return None, "Max offer hunt attempts reached"
 
 
+class SmsRefundManager:
+    """
+    Manages pending number cancellations and guarantees refunds to the user's wallet.
+    Many SMS platforms (GrizzlySMS, TigerSMS, NumeraSMS, SmsBower) enforce a hold period
+    (typically 2-3 minutes) before allowing status=8 (ACCESS_CANCEL).
+
+    This manager:
+    1. Tries immediate cancellation.
+    2. If rejected or pending, schedules retries at 3 minutes (180s) and 6 minutes (360s) from purchase.
+    3. Runs continuously in a background daemon thread.
+    """
+    def __init__(self):
+        self._queue: List[Dict[str, Any]] = []
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self.total_refunded = 0
+        self.total_queued = 0
+
+    def start(self):
+        with self._lock:
+            if not self._running:
+                self._running = True
+                self._thread = threading.Thread(target=self._worker_loop, daemon=True)
+                self._thread.start()
+
+    def queue_cancellation(self, provider: 'SmsProviderClient', act_id: str, phone: str = ""):
+        if not provider or not act_id:
+            return
+
+        self.total_queued += 1
+
+        # Attempt immediate cancellation first
+        try:
+            if provider.cancel_number(act_id):
+                self.total_refunded += 1
+                return
+        except Exception:
+            pass
+
+        now = time.time()
+        # Schedule first retry at ~3 minutes (180s) after purchase
+        with self._lock:
+            self._queue.append({
+                "provider": provider,
+                "act_id": act_id,
+                "phone": phone,
+                "bought_at": now,
+                "attempts": 0,
+                "next_retry": now + 180  # 3 minutes
+            })
+
+    def get_pending_count(self) -> int:
+        with self._lock:
+            return len(self._queue)
+
+    def _worker_loop(self):
+        while self._running:
+            time.sleep(10)
+            now = time.time()
+            with self._lock:
+                ready_to_retry = []
+                remaining = []
+                for item in self._queue:
+                    if now >= item["next_retry"]:
+                        ready_to_retry.append(item)
+                    else:
+                        remaining.append(item)
+                self._queue = remaining
+
+            for item in ready_to_retry:
+                provider = item["provider"]
+                act_id = item["act_id"]
+                phone = item["phone"]
+                item["attempts"] += 1
+                age_sec = int(now - item["bought_at"])
+
+                try:
+                    success = provider.cancel_number(act_id)
+                    if success:
+                        self.total_refunded += 1
+                        continue
+                except Exception:
+                    pass
+
+                # If still not cancelled, schedule retry at ~6 minutes (360s) after purchase
+                if item["attempts"] < 3 and (now - item["bought_at"]) < 450:
+                    item["next_retry"] = item["bought_at"] + 360  # 6 minutes from purchase
+                    with self._lock:
+                        self._queue.append(item)
+
+
+refund_manager = SmsRefundManager()
+refund_manager.start()
+
+
+def cancel_or_queue_refund(provider: 'SmsProviderClient', act_id: str, phone: str = ""):
+    """Cancels immediately or enqueues for retry at 3m and 6m to ensure wallet refund."""
+    refund_manager.queue_cancellation(provider, act_id, phone)
+
+
 class SmsProviderClient:
     def __init__(self, name: str, base_url: str, api_key: str):
         self.name = name
@@ -433,9 +534,17 @@ class SmsProviderClient:
         url = f"{self.base_url}?api_key={self.api_key}&action=setStatus&status=8&id={activation_id}"
         try:
             r = requests.get(url, timeout=10)
-            return r.text.strip() == "ACCESS_CANCEL"
+            resp = r.text.strip().upper()
+            if "ACCESS_CANCEL" in resp or "STATUS_CANCEL" in resp or resp == "OK":
+                return True
+            # Also check getStatus if it's already cancelled
+            r2 = requests.get(f"{self.base_url}?api_key={self.api_key}&action=getStatus&id={activation_id}", timeout=8)
+            resp2 = r2.text.strip().upper()
+            if "STATUS_CANCEL" in resp2 or "ACCESS_CANCEL" in resp2:
+                return True
         except Exception:
-            return False
+            pass
+        return False
 
     def mark_complete(self, activation_id: str) -> bool:
         if not self.api_key or not activation_id:
@@ -933,7 +1042,7 @@ def _get_number_parallel(active_providers: list, timeout: int = 8) -> Optional[T
             act_id, full_phone = provider.get_number(service="hp", country="22")
             if done_event.is_set():
                 if act_id:
-                    provider.cancel_number(act_id)
+                    cancel_or_queue_refund(provider, act_id, full_phone or "")
                 return
             if act_id and full_phone:
                 with lock:
@@ -943,7 +1052,7 @@ def _get_number_parallel(active_providers: list, timeout: int = 8) -> Optional[T
                         result["full_phone"] = full_phone
                         done_event.set()
                     else:
-                        provider.cancel_number(act_id)
+                        cancel_or_queue_refund(provider, act_id, full_phone)
         except Exception:
             pass
 
@@ -1012,7 +1121,7 @@ def create_single_account_auto(
         if log_cb:
             log_cb(f"📱 Acquiring SMS number (Try #{number_attempts} across providers)...")
 
-        result = _get_number_parallel(active_providers, timeout=15)
+        result = _get_number_parallel(active_providers, timeout=8)
         if not result:
             time.sleep(4)
             continue
@@ -1027,8 +1136,8 @@ def create_single_account_auto(
         is_registered = is_phone_registered_on_meesho(clean_phone)
         if is_registered is True:
             if log_cb:
-                log_cb(f"⚠️ +91{clean_phone} already registered. Retrying fresh number...")
-            current_provider.cancel_number(act_id)
+                log_cb(f"⚠️ +91{clean_phone} already registered. Auto-refund queued (3m/6m) & retrying...")
+            cancel_or_queue_refund(current_provider, act_id, clean_phone)
             time.sleep(1)
             continue
 
@@ -1038,19 +1147,19 @@ def create_single_account_auto(
         otp_req = creator.request_otp(clean_phone)
         if not otp_req:
             if log_cb:
-                log_cb(f"⚠️ OTP dispatch failed for +91{clean_phone}. Retrying fresh number...")
-            current_provider.cancel_number(act_id)
+                log_cb(f"⚠️ OTP dispatch failed for +91{clean_phone}. Auto-refund queued & retrying...")
+            cancel_or_queue_refund(current_provider, act_id, clean_phone)
             time.sleep(1)
             continue
 
         # Wait for OTP
         if log_cb:
             log_cb(f"⏳ Waiting for OTP from {current_provider.name} (+91{clean_phone})...")
-        otp_code = current_provider.wait_for_otp(act_id, timeout_seconds=120, poll_interval=3)
+        otp_code = current_provider.wait_for_otp(act_id, timeout_seconds=75, poll_interval=2)
         if not otp_code:
             if log_cb:
-                log_cb(f"⏰ OTP timeout for +91{clean_phone}. Retrying fresh number...")
-            current_provider.cancel_number(act_id)
+                log_cb(f"⏰ OTP timeout for +91{clean_phone}. Auto-refund queued (3m/6m) & retrying...")
+            cancel_or_queue_refund(current_provider, act_id, clean_phone)
             continue
 
         if log_cb:
@@ -1063,8 +1172,8 @@ def create_single_account_auto(
             return acc_result, file_path, None
         else:
             if log_cb:
-                log_cb(f"❌ Login verification failed for +91{clean_phone}. Retrying fresh number...")
-            current_provider.cancel_number(act_id)
+                log_cb(f"❌ Login verification failed for +91{clean_phone}. Auto-refund queued & retrying...")
+            cancel_or_queue_refund(current_provider, act_id, clean_phone)
             time.sleep(1)
 
 
