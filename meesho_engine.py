@@ -7,6 +7,7 @@ import base64
 import random
 import hashlib
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple, Callable
@@ -272,12 +273,18 @@ class FodOfferHunter:
 
     def hunt_top_device(self, max_attempts: int = 40, log_cb: Optional[Callable[[str], None]] = None) -> Tuple[Optional[Dict[str, Any]], str]:
         pool = []
-        for attempt in range(1, max_attempts + 1):
-            if not pool:
-                pool = list(FLAGSHIP_DEVICES)
-                random.shuffle(pool)
+        for _ in range(3):
+            sub = list(FLAGSHIP_DEVICES)
+            random.shuffle(sub)
+            pool.extend(sub)
 
-            dev = pool.pop(0)
+        result = {"record": None, "desc": ""}
+        stop_event = threading.Event()
+        lock = threading.Lock()
+
+        def _test_single(dev):
+            if stop_event.is_set():
+                return
             instance_id = uuid.uuid4().hex
             gaid = str(uuid.uuid4()).upper()
             session_id = str(uuid.uuid4()).upper()
@@ -291,9 +298,9 @@ class FodOfferHunter:
             try:
                 # 1. Acquire Guest XO Token
                 h1 = self._build_headers(dev, instance_id, gaid, session_id, client_ip)
-                r1 = requests.get(f"{MEESHO_BASE}/api/1.0/anonymous/config", headers=h1, timeout=8)
+                r1 = requests.get(f"{MEESHO_BASE}/api/1.0/anonymous/config", headers=h1, timeout=6)
                 if r1.status_code != 200:
-                    continue
+                    return
 
                 try:
                     res1_raw = r1.json()
@@ -302,7 +309,7 @@ class FodOfferHunter:
                 res1 = res1_raw if isinstance(res1_raw, dict) else {}
                 xo_token = res1.get("xoox", {}).get("xo", "") if isinstance(res1.get("xoox"), dict) else ""
                 if not xo_token:
-                    continue
+                    return
 
                 # 2. Apply Referral Telemetry & Dynamic Packages
                 h2 = self._build_headers(dev, instance_id, gaid, session_id, client_ip, xo_token)
@@ -326,9 +333,9 @@ class FodOfferHunter:
                     "apps_installed": dynamic_packages
                 }
 
-                r3 = requests.post(f"{MEESHO_BASE}/api/1.0/anonymous/fod-personalisation", json=init_payload, headers=h2, timeout=10)
+                r3 = requests.post(f"{MEESHO_BASE}/api/1.0/anonymous/fod-personalisation", json=init_payload, headers=h2, timeout=8)
                 if r3.status_code != 200:
-                    continue
+                    return
 
                 try:
                     res3_raw = r3.json()
@@ -337,7 +344,7 @@ class FodOfferHunter:
                 res3 = res3_raw if isinstance(res3_raw, dict) else {}
                 fod = res3.get("surgical_first_order_discount_v3")
                 if not isinstance(fod, dict):
-                    continue
+                    return
 
                 b1 = str(fod.get("offer_bucket", ""))
                 off1 = fod.get("offer") if isinstance(fod.get("offer"), dict) else {}
@@ -346,31 +353,44 @@ class FodOfferHunter:
                 val = int(m1) if m1.isdigit() else (int(b1) if b1.isdigit() else 0)
 
                 status_desc = f"₹{val} OFF ({offer_txt})"
-                if log_cb:
-                    log_cb(f"Device test [{dev['brand']} {dev['model']}]: {status_desc}")
+                if log_cb and not stop_event.is_set():
+                    log_cb(f"Tested {dev['brand']} {dev['model']}: {status_desc}")
 
                 if val >= self.min_offer:
-                    device_record = {
-                        "device_profile": dev,
-                        "instance_id": instance_id,
-                        "gaid": gaid,
-                        "session_id": session_id,
-                        "shield_session_id": shield_session_id,
-                        "xo_token": xo_token,
-                        "offer_value": val,
-                        "offer_text": offer_txt,
-                        "carrier": carrier_name,
-                        "connection_type": conn_type,
-                        "client_ip": client_ip,
-                        "dynamic_packages": dynamic_packages,
-                        "referral_metadata": self.ref_meta
-                    }
-                    return device_record, status_desc
-
+                    with lock:
+                        if not result["record"]:
+                            result["record"] = {
+                                "device_profile": dev,
+                                "instance_id": instance_id,
+                                "gaid": gaid,
+                                "session_id": session_id,
+                                "shield_session_id": shield_session_id,
+                                "xo_token": xo_token,
+                                "offer_value": val,
+                                "offer_text": offer_txt,
+                                "carrier": carrier_name,
+                                "connection_type": conn_type,
+                                "client_ip": client_ip,
+                                "dynamic_packages": dynamic_packages,
+                                "referral_metadata": self.ref_meta
+                            }
+                            result["desc"] = status_desc
+                            stop_event.set()
             except Exception:
-                continue
+                pass
 
-            time.sleep(0.2)
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(_test_single, d) for d in pool[:max_attempts]]
+            for future in futures:
+                if stop_event.is_set():
+                    break
+                try:
+                    future.result(timeout=10)
+                except Exception:
+                    pass
+
+        if result["record"]:
+            return result["record"], result["desc"]
 
         return None, "Max offer hunt attempts reached"
 
@@ -427,11 +447,11 @@ class SmsProviderClient:
         except Exception:
             return False
 
-    def wait_for_otp(self, activation_id: str, timeout_seconds: int = 120, poll_interval: int = 3, log_cb: Optional[Callable[[str], None]] = None) -> Optional[str]:
+    def wait_for_otp(self, activation_id: str, timeout_seconds: int = 75, poll_interval: int = 2, log_cb: Optional[Callable[[str], None]] = None) -> Optional[str]:
         start_time = time.time()
         while time.time() - start_time < timeout_seconds:
             try:
-                r = requests.get(f"{self.base_url}?api_key={self.api_key}&action=getStatus&id={activation_id}", timeout=10)
+                r = requests.get(f"{self.base_url}?api_key={self.api_key}&action=getStatus&id={activation_id}", timeout=8)
                 resp = r.text.strip()
                 if resp.startswith("STATUS_OK"):
                     return resp.split(":")[1]
@@ -901,7 +921,7 @@ def save_session_file(acc_data: Dict[str, Any]) -> str:
     return file_path
 
 
-def _get_number_parallel(active_providers: list, timeout: int = 15) -> Optional[Tuple[Any, str, str]]:
+def _get_number_parallel(active_providers: list, timeout: int = 8) -> Optional[Tuple[Any, str, str]]:
     result = {"provider": None, "act_id": None, "full_phone": None}
     done_event = threading.Event()
     lock = threading.Lock()
@@ -917,7 +937,7 @@ def _get_number_parallel(active_providers: list, timeout: int = 15) -> Optional[
                 return
             if act_id and full_phone:
                 with lock:
-                    if not result["provider"]:
+                    if not result["provider"] and not done_event.is_set():
                         result["provider"] = provider
                         result["act_id"] = act_id
                         result["full_phone"] = full_phone
