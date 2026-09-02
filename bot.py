@@ -6,6 +6,7 @@ import json
 import html
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
@@ -276,7 +277,7 @@ def cmd_cancel(message: types.Message):
 # ─────────────────────────────────────────────────────────────
 # AUTO ACCOUNT CREATION PIPELINE (BACKGROUND THREAD)
 # ─────────────────────────────────────────────────────────────
-def _run_account_creation_worker(chat_id: int, count: int, min_offer: int, ref_link: str):
+def _run_account_creation_worker(chat_id: int, count: int, min_offer: int, ref_link: str, parallel: int = 0):
     global active_tasks_count
     with active_tasks_lock:
         active_tasks_count += 1
@@ -285,16 +286,19 @@ def _run_account_creation_worker(chat_id: int, count: int, min_offer: int, ref_l
     settings["stop_requested"] = False
     settings["is_generating"] = True
 
+    if parallel <= 0:
+        parallel = min(count, 5)
+
     try:
         ref_meta = meesho_engine.parse_referral_link(ref_link)
         status_msg = bot.send_message(
             chat_id,
-            f"🚀 <b>Starting Continuous Meesho Account Generation</b>\n\n"
+            f"⚡ <b>Starting High-Speed Parallel Meesho Account Generation</b>\n\n"
             f"• <b>Target Accounts:</b> {count}\n"
+            f"• <b>Parallel Workers:</b> {parallel} concurrent threads 🚀\n"
             f"• <b>Min FOD Discount:</b> ≥ ₹{esc(min_offer)} OFF\n"
-            f"• <b>Referral Code:</b> <code>{esc(ref_meta.get('via') or 'None')}</code>\n"
-            f"• <b>Mode:</b> <i>Continuous retry until JSON is generated ✅</i>\n\n"
-            f"⏳ <i>Searching active SMS providers and hunting devices...</i>\n"
+            f"• <b>Referral Code:</b> <code>{esc(ref_meta.get('via') or 'None')}</code>\n\n"
+            f"⏳ <i>All SMS providers searching numbers in parallel...</i>\n"
             f"<i>(Send <code>/stop</code> anytime to cancel)</i>"
         )
 
@@ -309,73 +313,99 @@ def _run_account_creation_worker(chat_id: int, count: int, min_offer: int, ref_l
             return
 
         success_count = 0
+        success_lock = threading.Lock()
+        active_status = {}
+        status_update_lock = threading.Lock()
+        last_edit_time = [0.0]
 
-        for i in range(1, count + 1):
-            if settings.get("stop_requested"):
-                bot.send_message(chat_id, "🛑 <b>Generation stopped by user request.</b>", reply_markup=build_main_keyboard())
-                break
+        def update_ui_status():
+            now = time.time()
+            if now - last_edit_time[0] < 2.0:
+                return
+            last_edit_time[0] = now
+            with status_update_lock:
+                status_lines = []
+                for wid, st in sorted(active_status.items()):
+                    status_lines.append(f"• <b>Worker #{wid}:</b> {esc(st)}")
 
-            def log_progress(text: str):
+                ui_text = (
+                    f"⚡ <b>Generating {count} Accounts in Parallel ({parallel} Workers)</b>\n\n"
+                    f"• <b>Progress:</b> {success_count}/{count} completed\n"
+                    f"• <b>Target Offer:</b> ≥ ₹{esc(min_offer)} OFF\n\n"
+                    + "\n".join(status_lines[-6:])
+                )
                 try:
                     bot.send_chat_action(chat_id, "typing")
-                    bot.edit_message_text(
-                        f"🚀 <b>Generating Account {i}/{count}</b>\n\n"
-                        f"• <b>Status:</b> {esc(text)}\n"
-                        f"• <b>Target Offer:</b> ≥ ₹{esc(min_offer)} OFF\n"
-                        f"• <b>Referral:</b> <code>{esc(ref_meta.get('via') or 'None')}</code>\n\n"
-                        f"<i>Retrying numbers automatically until JSON is delivered...</i>",
-                        chat_id,
-                        status_msg.message_id
-                    )
+                    bot.edit_message_text(ui_text, chat_id, status_msg.message_id)
                 except Exception:
                     pass
 
-            acc_data, session_file, err = meesho_engine.create_single_account_auto(
-                min_offer=min_offer,
-                ref_meta=ref_meta,
-                active_providers=providers,
-                log_cb=log_progress,
-                stop_check=lambda: settings.get("stop_requested", False)
-            )
+        def _worker_task(worker_id: int):
+            nonlocal success_count
+            while True:
+                if settings.get("stop_requested"):
+                    break
+                with success_lock:
+                    if success_count >= count:
+                        break
 
-            if settings.get("stop_requested"):
-                bot.send_message(chat_id, "🛑 <b>Generation stopped by user request.</b>", reply_markup=build_main_keyboard())
-                break
+                def log_progress(text: str):
+                    active_status[worker_id] = text
+                    update_ui_status()
 
-            if acc_data and session_file and os.path.exists(session_file):
-                success_count += 1
-                phone = acc_data.get("mobile") or acc_data.get("created_phone")
-                user_id = acc_data.get("user_id")
-                offer = acc_data.get("harvested_offer", {})
-                offer_txt = offer.get("offer_text") or f"₹{offer.get('offer_value')} OFF"
-                dev = acc_data.get("device_profile", {})
-                dev_str = f"{dev.get('brand')} {dev.get('model')}"
-
-                summary = (
-                    f"🎉 <b>[Success {i}/{count}] Account Generated!</b>\n\n"
-                    f"📱 <b>Phone:</b> <code>+91{esc(phone)}</code>\n"
-                    f"🆔 <b>User ID:</b> <code>{esc(user_id)}</code>\n"
-                    f"🎁 <b>FOD Offer:</b> <b>{esc(offer_txt)}</b>\n"
-                    f"🔗 <b>Referral Code:</b> <code>{esc(ref_meta.get('via') or 'Organic')}</code>\n"
-                    f"📱 <b>Device Bound:</b> {esc(dev_str)}\n"
-                    f"📁 <b>Session File:</b> <code>{esc(os.path.basename(session_file))}</code>"
+                acc_data, session_file, err = meesho_engine.create_single_account_auto(
+                    min_offer=min_offer,
+                    ref_meta=ref_meta,
+                    active_providers=providers,
+                    log_cb=log_progress,
+                    stop_check=lambda: settings.get("stop_requested", False)
                 )
 
-                with open(session_file, "rb") as doc:
-                    bot.send_document(
-                        chat_id,
-                        doc,
-                        caption=summary,
-                        visible_file_name=os.path.basename(session_file)
-                    )
-            else:
-                if not settings.get("stop_requested"):
-                    bot.send_message(
-                        chat_id,
-                        f"⚠️ <b>Account {i}/{count} Note:</b> {esc(err or 'Retry stopped')}"
+                if settings.get("stop_requested"):
+                    break
+
+                if acc_data and session_file and os.path.exists(session_file):
+                    with success_lock:
+                        if success_count >= count:
+                            break
+                        success_count += 1
+                        current_num = success_count
+
+                    phone = acc_data.get("mobile") or acc_data.get("created_phone")
+                    user_id = acc_data.get("user_id")
+                    offer = acc_data.get("harvested_offer", {})
+                    offer_txt = offer.get("offer_text") or f"₹{offer.get('offer_value')} OFF"
+                    dev = acc_data.get("device_profile", {})
+                    dev_str = f"{dev.get('brand')} {dev.get('model')}"
+
+                    summary = (
+                        f"🎉 <b>[Success #{current_num}/{count}] Account Generated!</b>\n\n"
+                        f"📱 <b>Phone:</b> <code>+91{esc(phone)}</code>\n"
+                        f"🆔 <b>User ID:</b> <code>{esc(user_id)}</code>\n"
+                        f"🎁 <b>FOD Offer:</b> <b>{esc(offer_txt)}</b>\n"
+                        f"🔗 <b>Referral Code:</b> <code>{esc(ref_meta.get('via') or 'Organic')}</code>\n"
+                        f"📱 <b>Device Bound:</b> {esc(dev_str)}\n"
+                        f"📁 <b>Session File:</b> <code>{esc(os.path.basename(session_file))}</code>"
                     )
 
-            time.sleep(1)
+                    with open(session_file, "rb") as doc:
+                        bot.send_document(
+                            chat_id,
+                            doc,
+                            caption=summary,
+                            visible_file_name=os.path.basename(session_file)
+                        )
+                    break
+                else:
+                    time.sleep(1)
+
+        with ThreadPoolExecutor(max_workers=parallel) as executor:
+            futures = [executor.submit(_worker_task, w_id) for w_id in range(1, count + 1)]
+            for f in as_completed(futures):
+                try:
+                    f.result()
+                except Exception as e:
+                    logger.error(f"Worker exception: {e}")
 
         if not settings.get("stop_requested") and success_count > 0:
             bot.send_message(
@@ -385,7 +415,7 @@ def _run_account_creation_worker(chat_id: int, count: int, min_offer: int, ref_l
             )
 
     except Exception as e:
-        logger.exception("Error in account creation worker")
+        logger.exception("Error in parallel account creation worker")
         bot.send_message(chat_id, f"❌ <b>Error occurred during execution:</b> {esc(str(e))}")
     finally:
         settings["is_generating"] = False
@@ -403,19 +433,23 @@ def cmd_create(message: types.Message):
     count = 1
     min_offer = settings["min_offer"]
     ref_link = settings["referral"]
+    parallel = 0
 
     if len(args) >= 1 and args[0].isdigit():
         count = max(1, min(int(args[0]), 20))
 
     if len(args) >= 2 and args[1].isdigit():
-        min_offer = int(args[1])
+        parallel = max(1, min(int(args[1]), 10))
 
-    if len(args) >= 3:
-        ref_link = args[2]
+    if len(args) >= 3 and args[2].isdigit():
+        min_offer = int(args[2])
+
+    if len(args) >= 4:
+        ref_link = args[3]
 
     t = threading.Thread(
         target=_run_account_creation_worker,
-        args=(chat_id, count, min_offer, ref_link),
+        args=(chat_id, count, min_offer, ref_link, parallel),
         daemon=True
     )
     t.start()
@@ -583,10 +617,10 @@ def handle_callbacks(call: types.CallbackQuery):
         t.start()
 
     elif call.data == "cb_create_3":
-        bot.answer_callback_query(call.id, "Starting 3 Accounts Creation...")
+        bot.answer_callback_query(call.id, "Starting 3 Accounts Parallel Creation...")
         t = threading.Thread(
             target=_run_account_creation_worker,
-            args=(chat_id, 3, settings["min_offer"], settings["referral"]),
+            args=(chat_id, 3, settings["min_offer"], settings["referral"], 3),
             daemon=True
         )
         t.start()
