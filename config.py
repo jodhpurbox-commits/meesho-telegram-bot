@@ -16,7 +16,7 @@ SMSBOWER_API_KEY = os.getenv("SMSBOWER_API_KEY", "JDvqNuzbtpc2YB6t52TrNOdLZdtu50
 # 🔗 DEFAULT MEESHO REFERRAL LINK / CODE
 DEFAULT_REFERRAL_LINK = os.getenv(
     "MEESHO_REFERRAL_LINK",
-    "https://app.meesho.com/2yoV/r99th0qd?via=9r3b32&from=referral_program"
+    "https://app.meesho.com/2yoV/r99th0qd?via=i5bxd&from=home_page_pill"
 )
 
 # STRICT MINIMUM DISCOUNT (e.g., 180, 150, 200)
