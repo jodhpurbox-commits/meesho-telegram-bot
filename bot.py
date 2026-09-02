@@ -168,16 +168,17 @@ def create_sessions_zip() -> Optional[str]:
 def build_main_keyboard() -> types.InlineKeyboardMarkup:
     markup = types.InlineKeyboardMarkup(row_width=2)
     b1 = types.InlineKeyboardButton("⚡ Create 1 Account", callback_data="cb_create_1")
-    b2 = types.InlineKeyboardButton("🚀 Create 3 Accounts", callback_data="cb_create_3")
-    b3 = types.InlineKeyboardButton("📱 Manual OTP Login", callback_data="cb_manual_start")
-    b4 = types.InlineKeyboardButton("💰 Check SMS Balances", callback_data="cb_balance")
-    b5 = types.InlineKeyboardButton("📁 Browse & Download JSONs", callback_data="cb_sessions")
-    b6 = types.InlineKeyboardButton("📦 Download All (ZIP)", callback_data="cb_download_all_zip")
-    b7 = types.InlineKeyboardButton("⚙️ Current Settings", callback_data="cb_settings")
+    b2 = types.InlineKeyboardButton("🚀 Create 5 Accounts (5x)", callback_data="cb_create_5")
+    b3 = types.InlineKeyboardButton("💥 Create 20 Accounts (20x Turbo)", callback_data="cb_create_20")
+    b4 = types.InlineKeyboardButton("📱 Manual OTP Login", callback_data="cb_manual_start")
+    b5 = types.InlineKeyboardButton("💰 Check SMS Balances", callback_data="cb_balance")
+    b6 = types.InlineKeyboardButton("📁 Browse & Download JSONs", callback_data="cb_sessions")
+    b7 = types.InlineKeyboardButton("📦 Download All (ZIP)", callback_data="cb_download_all_zip")
+    b8 = types.InlineKeyboardButton("⚙️ Current Settings", callback_data="cb_settings")
     markup.add(b1, b2)
     markup.add(b3, b4)
     markup.add(b5, b6)
-    markup.add(b7)
+    markup.add(b7, b8)
     return markup
 
 
@@ -482,7 +483,7 @@ def _run_account_creation_worker(chat_id: int, count: int, min_offer: int, ref_l
     settings["is_generating"] = True
 
     if parallel <= 0:
-        parallel = min(count, 5)
+        parallel = min(count, 20)
 
     try:
         ref_meta = meesho_engine.parse_referral_link(ref_link)
@@ -609,10 +610,10 @@ def cmd_create(message: types.Message):
     parallel = 0
 
     if len(args) >= 1 and args[0].isdigit():
-        count = max(1, min(int(args[0]), 20))
+        count = max(1, min(int(args[0]), 100))
 
     if len(args) >= 2 and args[1].isdigit():
-        parallel = max(1, min(int(args[1]), 10))
+        parallel = max(1, min(int(args[1]), 20))
 
     if len(args) >= 3 and args[2].isdigit():
         min_offer = int(args[2])
@@ -773,6 +774,24 @@ def handle_callbacks(call: types.CallbackQuery):
         t = threading.Thread(
             target=_run_account_creation_worker,
             args=(chat_id, 3, settings["min_offer"], settings["referral"], 3),
+            daemon=True
+        )
+        t.start()
+
+    elif call.data == "cb_create_5":
+        bot.answer_callback_query(call.id, "Starting 5 Accounts Parallel (5x)...")
+        t = threading.Thread(
+            target=_run_account_creation_worker,
+            args=(chat_id, 5, settings["min_offer"], settings["referral"], 5),
+            daemon=True
+        )
+        t.start()
+
+    elif call.data == "cb_create_20":
+        bot.answer_callback_query(call.id, "Starting 20 Accounts Turbo Parallel (20x)...")
+        t = threading.Thread(
+            target=_run_account_creation_worker,
+            args=(chat_id, 20, settings["min_offer"], settings["referral"], 20),
             daemon=True
         )
         t.start()
