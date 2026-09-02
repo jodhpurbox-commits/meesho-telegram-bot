@@ -249,12 +249,16 @@ def cmd_status(message: types.Message):
     hours, rem = divmod(uptime_sec, 3600)
     minutes, seconds = divmod(rem, 60)
     total_sessions = len(get_unique_session_files())
+    pending_refunds = meesho_engine.refund_manager.get_pending_count()
+    total_refunded = meesho_engine.refund_manager.total_refunded
 
     text = (
         "📊 <b>Bot & Server Status:</b>\n\n"
         f"• <b>Uptime:</b> {hours}h {minutes}m {seconds}s\n"
         f"• <b>Active Tasks:</b> {active_tasks_count}\n"
         f"• <b>Total Stored Sessions:</b> {total_sessions} accounts\n"
+        f"• <b>Auto-Refunds Recovered:</b> {total_refunded} numbers ✅\n"
+        f"• <b>Pending Refund Retries (3m/6m):</b> {pending_refunds} numbers\n"
         f"• <b>Render Health Port:</b> {config.PORT} (Alive 24/7 ✅)\n"
         f"• <b>Time:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
     )
@@ -286,6 +290,11 @@ def cmd_balance(message: types.Message):
             lines.append(f"• <b>{esc(p.name)}:</b> <i>Query failed</i>")
 
     lines.append(f"\n✅ <b>Active Providers Ready:</b> {active_count}/{len(providers)}")
+    pending_refunds = meesho_engine.refund_manager.get_pending_count()
+    total_refunded = meesho_engine.refund_manager.total_refunded
+    if pending_refunds > 0 or total_refunded > 0:
+        lines.append(f"🔄 <b>Wallet Protection:</b> {total_refunded} refunded, {pending_refunds} retrying at 3m/6m")
+
     bot.edit_message_text("\n".join(lines), chat_id, msg.message_id)
 
 
