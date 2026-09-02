@@ -949,7 +949,7 @@ def create_single_account_auto(
     stop_check: Optional[Callable[[], bool]] = None
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
     """
-    Automated generation of 1 account.
+    Automated generation of 1 account with continuous retry until success.
     Returns: (acc_data, session_file_path, error_message)
     """
     ref_meta = ref_meta or parse_referral_link(DEFAULT_REFERRAL_LINK)
@@ -961,14 +961,20 @@ def create_single_account_auto(
     if not active_providers:
         return None, None, "No SMS provider with active balance found."
 
-    # Step 1: Hunt for top device offer
-    if log_cb:
-        log_cb(f"🔍 Hunting high discount FOD offer (≥ ₹{min_offer})...")
-
-    hunter = FodOfferHunter(min_offer=min_offer, ref_meta=ref_meta)
-    harvested_dev, offer_desc = hunter.hunt_top_device(max_attempts=35)
-    if not harvested_dev:
-        return None, None, f"Could not secure ₹{min_offer}+ FOD offer after hunting."
+    # Continuous hunt loop until top offer device is secured
+    hunt_attempt = 0
+    harvested_dev = None
+    offer_desc = ""
+    while not harvested_dev:
+        if stop_check and stop_check():
+            return None, None, "Operation cancelled by user."
+        hunt_attempt += 1
+        if log_cb:
+            log_cb(f"🔍 Hunting FOD offer (≥ ₹{min_offer}) [Cycle #{hunt_attempt}]...")
+        hunter = FodOfferHunter(min_offer=min_offer, ref_meta=ref_meta)
+        harvested_dev, offer_desc = hunter.hunt_top_device(max_attempts=40)
+        if not harvested_dev:
+            time.sleep(3)
 
     dev_name = f"{harvested_dev['device_profile']['brand']} {harvested_dev['device_profile']['model']}"
     if log_cb:
@@ -976,15 +982,15 @@ def create_single_account_auto(
 
     creator = MeeshoOfferAccountCreator(harvested_dev)
     number_attempts = 0
-    max_number_attempts = 15
 
-    while number_attempts < max_number_attempts:
+    # Continuous number & OTP loop until account is successfully generated
+    while True:
         if stop_check and stop_check():
             return None, None, "Operation cancelled by user."
 
         number_attempts += 1
         if log_cb:
-            log_cb(f"📱 Acquiring fresh SMS number (Attempt #{number_attempts})...")
+            log_cb(f"📱 Acquiring SMS number (Try #{number_attempts} across providers)...")
 
         result = _get_number_parallel(active_providers, timeout=15)
         if not result:
@@ -1001,7 +1007,7 @@ def create_single_account_auto(
         is_registered = is_phone_registered_on_meesho(clean_phone)
         if is_registered is True:
             if log_cb:
-                log_cb(f"⚠️ +91{clean_phone} already registered. Cancelling...")
+                log_cb(f"⚠️ +91{clean_phone} already registered. Retrying fresh number...")
             current_provider.cancel_number(act_id)
             time.sleep(1)
             continue
@@ -1012,18 +1018,18 @@ def create_single_account_auto(
         otp_req = creator.request_otp(clean_phone)
         if not otp_req:
             if log_cb:
-                log_cb("⚠️ Otpless OTP dispatch failed. Retrying with fresh number...")
+                log_cb(f"⚠️ OTP dispatch failed for +91{clean_phone}. Retrying fresh number...")
             current_provider.cancel_number(act_id)
             time.sleep(1)
             continue
 
         # Wait for OTP
         if log_cb:
-            log_cb(f"⏳ Waiting for OTP from {current_provider.name} (up to 120s)...")
+            log_cb(f"⏳ Waiting for OTP from {current_provider.name} (+91{clean_phone})...")
         otp_code = current_provider.wait_for_otp(act_id, timeout_seconds=120, poll_interval=3)
         if not otp_code:
             if log_cb:
-                log_cb(f"⏰ OTP timeout for +91{clean_phone}. Cancelling...")
+                log_cb(f"⏰ OTP timeout for +91{clean_phone}. Retrying fresh number...")
             current_provider.cancel_number(act_id)
             continue
 
@@ -1037,10 +1043,9 @@ def create_single_account_auto(
             return acc_result, file_path, None
         else:
             if log_cb:
-                log_cb("❌ Login verification failed. Cancelling number...")
+                log_cb(f"❌ Login verification failed for +91{clean_phone}. Retrying fresh number...")
             current_provider.cancel_number(act_id)
-
-    return None, None, f"Failed to create account after {max_number_attempts} number attempts."
+            time.sleep(1)
 
 
 def prepare_manual_otp(
