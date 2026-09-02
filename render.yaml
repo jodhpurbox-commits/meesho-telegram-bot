@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: meesho-telegram-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: GRIZZLY_API_KEY
+        sync: false
+      - key: NUMERASMS_API_KEY
+        sync: false
+      - key: TIGERSMS_API_KEY
+        sync: false
+      - key: NEXNUM_API_KEY
+        sync: false
+      - key: SMSBOWER_API_KEY
+        sync: false
+      - key: MEESHO_REFERRAL_LINK
+        value: "https://app.meesho.com/2yoV/r99th0qd?via=9r3b32&from=referral_program"
+      - key: MIN_OFFER_DISCOUNT
+        value: "180"
+      - key: PORT
+        value: "10000"
