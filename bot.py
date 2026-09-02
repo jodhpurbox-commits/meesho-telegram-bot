@@ -4,11 +4,12 @@ import time
 import glob
 import json
 import html
+import zipfile
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 from flask import Flask, jsonify
 import telebot
@@ -71,16 +72,97 @@ def run_flask_server():
 
 
 # ─────────────────────────────────────────────────────────────
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS & SESSION RETRIEVAL
 # ─────────────────────────────────────────────────────────────
 def get_user_settings(chat_id: int) -> Dict[str, Any]:
     if chat_id not in user_states:
         user_states[chat_id] = {
             "referral": config.DEFAULT_REFERRAL_LINK,
             "min_offer": config.DEFAULT_MIN_OFFER,
-            "manual_flow": None
+            "manual_flow": None,
+            "stop_requested": False,
+            "is_generating": False
         }
     return user_states[chat_id]
+
+
+def get_unique_session_files() -> List[str]:
+    """Returns all unique session JSON files sorted newest first."""
+    patterns = [
+        "session_*_meesho.json",
+        "session_*.json",
+        os.path.join(os.getcwd(), "session_*_meesho.json"),
+        os.path.join(os.getcwd(), "session_*.json")
+    ]
+    seen = set()
+    unique = []
+    for pat in patterns:
+        for f in glob.glob(pat):
+            b = os.path.basename(f)
+            if b not in seen:
+                seen.add(b)
+                unique.append(f)
+    return sorted(unique, key=os.path.getmtime, reverse=True)
+
+
+def send_session_file(chat_id: int, file_path: str) -> bool:
+    """Sends a session JSON file as a downloadable document with rich metadata."""
+    if not os.path.exists(file_path):
+        bot.send_message(chat_id, "❌ Session file not found on server.")
+        return False
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+
+    phone = data.get("mobile") or data.get("created_phone") or (data.get("user") or {}).get("phone") or "N/A"
+    clean_p = "".join(filter(str.isdigit, str(phone)))
+    if len(clean_p) > 10:
+        clean_p = clean_p[-10:]
+
+    user_id = data.get("user_id") or (data.get("user") or {}).get("user_id") or "N/A"
+    offer = data.get("harvested_offer", {})
+    offer_txt = offer.get("offer_text") or (f"₹{offer.get('offer_value')} OFF" if offer.get("offer_value") else "N/A")
+    ref = data.get("referral_applied", {})
+    ref_via = ref.get("via") or "None"
+    dev = data.get("device_profile", {})
+    dev_str = f"{dev.get('brand', '')} {dev.get('model', '')}".strip() or "Standard"
+    created_at = data.get("created_at") or "Recent"
+
+    caption = (
+        f"📄 <b>Meesho Session JSON:</b> <code>{esc(os.path.basename(file_path))}</code>\n\n"
+        f"📱 <b>Phone:</b> <code>+91{esc(clean_p)}</code>\n"
+        f"🆔 <b>User ID:</b> <code>{esc(user_id)}</code>\n"
+        f"🎁 <b>FOD Offer:</b> <b>{esc(offer_txt)}</b>\n"
+        f"🔗 <b>Referral:</b> <code>{esc(ref_via)}</code>\n"
+        f"📱 <b>Device:</b> {esc(dev_str)}\n"
+        f"📅 <b>Created:</b> {esc(created_at)}"
+    )
+
+    with open(file_path, "rb") as doc:
+        bot.send_document(
+            chat_id,
+            doc,
+            caption=caption,
+            visible_file_name=os.path.basename(file_path)
+        )
+    return True
+
+
+def create_sessions_zip() -> Optional[str]:
+    """Zips all session JSON files and returns the path to the zip file."""
+    files = get_unique_session_files()
+    if not files:
+        return None
+
+    zip_filename = "meesho_all_sessions.zip"
+    with zipfile.ZipFile(zip_filename, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for fpath in files:
+            zipf.write(fpath, arcname=os.path.basename(fpath))
+
+    return zip_filename
 
 
 def build_main_keyboard() -> types.InlineKeyboardMarkup:
@@ -89,11 +171,35 @@ def build_main_keyboard() -> types.InlineKeyboardMarkup:
     b2 = types.InlineKeyboardButton("🚀 Create 3 Accounts", callback_data="cb_create_3")
     b3 = types.InlineKeyboardButton("📱 Manual OTP Login", callback_data="cb_manual_start")
     b4 = types.InlineKeyboardButton("💰 Check SMS Balances", callback_data="cb_balance")
-    b5 = types.InlineKeyboardButton("⚙️ Current Settings", callback_data="cb_settings")
-    b6 = types.InlineKeyboardButton("📁 View Recent Sessions", callback_data="cb_sessions")
+    b5 = types.InlineKeyboardButton("📁 Browse & Download JSONs", callback_data="cb_sessions")
+    b6 = types.InlineKeyboardButton("📦 Download All (ZIP)", callback_data="cb_download_all_zip")
+    b7 = types.InlineKeyboardButton("⚙️ Current Settings", callback_data="cb_settings")
     markup.add(b1, b2)
     markup.add(b3, b4)
     markup.add(b5, b6)
+    markup.add(b7)
+    return markup
+
+
+def build_sessions_keyboard(files: List[str]) -> types.InlineKeyboardMarkup:
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    buttons = []
+    for fpath in files[:12]:
+        fname = os.path.basename(fpath)
+        digits = "".join(filter(str.isdigit, fname))
+        phone_label = digits[-10:] if len(digits) >= 10 else fname[:14]
+        buttons.append(types.InlineKeyboardButton(f"📥 {phone_label}", callback_data=f"cb_dl_{phone_label}"))
+
+    for i in range(0, len(buttons), 2):
+        if i + 1 < len(buttons):
+            markup.add(buttons[i], buttons[i + 1])
+        else:
+            markup.add(buttons[i])
+
+    markup.add(
+        types.InlineKeyboardButton("📦 Download All (ZIP)", callback_data="cb_download_all_zip"),
+        types.InlineKeyboardButton("🔄 Refresh List", callback_data="cb_sessions")
+    )
     return markup
 
 
@@ -111,20 +217,25 @@ def cmd_start_help(message: types.Message):
     welcome_text = (
         "🤖 <b>Welcome to Meesho Account & JSON Session Generator Bot!</b>\n\n"
         "Generate fresh Meesho accounts with maximum First Order Discount (FOD ₹180+), "
-        "referral link attribution, and get <code>session_*.json</code> files instantly.\n\n"
+        "referral link attribution, and retrieve your <code>session_*.json</code> files 24/7.\n\n"
         "⚙️ <b>Active Configuration:</b>\n"
         f"• <b>Target Min Discount:</b> ≥ ₹{esc(settings['min_offer'])} OFF\n"
         f"• <b>Referral Code:</b> <code>{esc(via_code)}</code>\n"
         f"• <b>Hosting Status:</b> 24/7 Cloud Active ✅\n\n"
-        "📌 <b>Available Commands:</b>\n"
-        "• <code>/create [count] [min_offer] [ref_code]</code> — Auto generate accounts\n"
-        "• <code>/manual [phone]</code> — Step-by-step OTP login for your number\n"
+        "📌 <b>Account Creation Commands:</b>\n"
+        "• <code>/create [count] [parallel] [min_offer] [ref]</code> — Parallel auto generation\n"
+        "• <code>/manual [phone]</code> — Step-by-step manual OTP login\n"
+        "• <code>/stop</code> or <code>/cancel</code> — Stop active generation\n\n"
+        "📥 <b>JSON Retrieval Commands:</b>\n"
+        "• <code>/sessions</code> — Interactive browser with 1-tap download buttons\n"
+        "• <code>/get &lt;phone&gt;</code> — Download JSON for specific phone number\n"
+        "• <code>/last</code> — Download the latest created session JSON\n"
+        "• <code>/downloadall</code> or <code>/zip</code> — Download all sessions in a single ZIP\n\n"
+        "🔧 <b>Settings & Info:</b>\n"
         "• <code>/balance</code> — Check all SMS provider balances\n"
         "• <code>/referral &lt;code/url&gt;</code> — Change referral link/code\n"
         "• <code>/minoffer &lt;amount&gt;</code> — Set min discount (e.g. 180, 150, 200)\n"
-        "• <code>/sessions</code> — List recent session files\n"
-        "• <code>/status</code> — Check server uptime and worker status\n"
-        "• <code>/cancel</code> — Cancel active manual OTP flow\n\n"
+        "• <code>/status</code> — Server uptime and active worker stats\n\n"
         "<i>Tap a quick button below to start:</i>"
     )
     bot.send_message(chat_id, welcome_text, reply_markup=build_main_keyboard())
@@ -137,7 +248,7 @@ def cmd_status(message: types.Message):
     uptime_sec = int(time.time() - bot_start_time)
     hours, rem = divmod(uptime_sec, 3600)
     minutes, seconds = divmod(rem, 60)
-    total_sessions = len(glob.glob("session_*_meesho.json") + glob.glob("session_*.json"))
+    total_sessions = len(get_unique_session_files())
 
     text = (
         "📊 <b>Bot & Server Status:</b>\n\n"
@@ -223,37 +334,112 @@ def cmd_minoffer(message: types.Message):
         )
 
 
+# ─────────────────────────────────────────────────────────────
+# JSON RETRIEVAL HANDLERS (/sessions, /get, /last, /downloadall)
+# ─────────────────────────────────────────────────────────────
 @bot.message_handler(commands=["sessions"])
 def cmd_sessions(message: types.Message):
     chat_id = message.chat.id
-    files = sorted(
-        glob.glob("session_*_meesho.json") + glob.glob("session_*.json"),
-        key=os.path.getmtime,
-        reverse=True
-    )
+    files = get_unique_session_files()
+
     if not files:
-        bot.reply_to(message, "📂 No generated session files found on the server yet.")
+        bot.reply_to(message, "📂 No generated session files found on the server yet.\nUse <code>/create 1</code> to generate your first account!")
         return
 
-    seen = set()
-    unique_files = []
-    for f in files:
-        base = os.path.basename(f)
-        if base not in seen:
-            seen.add(base)
-            unique_files.append(f)
-
-    recent = unique_files[:10]
-    lines = [f"📁 <b>Recent Session JSONs ({len(unique_files)} total):</b>\n"]
-
-    for idx, fpath in enumerate(recent, 1):
+    lines = [f"📁 <b>Available Meesho Session JSONs ({len(files)} total):</b>\n"]
+    for idx, fpath in enumerate(files[:10], 1):
         fname = os.path.basename(fpath)
+        digits = "".join(filter(str.isdigit, fname))
+        phone_label = digits[-10:] if len(digits) >= 10 else fname
         mtime = datetime.fromtimestamp(os.path.getmtime(fpath)).strftime("%d/%m %H:%M")
         size_kb = os.path.getsize(fpath) / 1024
-        lines.append(f"{idx}. <code>{esc(fname)}</code> ({size_kb:.1f} KB, {mtime})")
+        lines.append(f"{idx}. 📱 <b>+91{esc(phone_label)}</b> — {size_kb:.1f} KB ({mtime})")
 
-    lines.append("\n<i>To download any session, use the button or create new accounts.</i>")
-    bot.reply_to(message, "\n".join(lines))
+    lines.append("\n👉 <i>Tap any button below to download the JSON instantly:</i>")
+    bot.reply_to(message, "\n".join(lines), reply_markup=build_sessions_keyboard(files))
+
+
+@bot.message_handler(commands=["get", "download", "json"])
+def cmd_get_session(message: types.Message):
+    chat_id = message.chat.id
+    args = message.text.split(maxsplit=1)
+
+    if len(args) < 2:
+        files = get_unique_session_files()
+        if not files:
+            bot.reply_to(message, "📂 No session files available yet.")
+            return
+        bot.reply_to(
+            message,
+            "📱 <b>Download Session JSON:</b>\n\n"
+            "Usage: <code>/get &lt;phone_number&gt;</code> (e.g. <code>/get 9566597321</code>)\n\n"
+            "<i>Or tap a recent number below:</i>",
+            reply_markup=build_sessions_keyboard(files)
+        )
+        return
+
+    query_phone = "".join(filter(str.isdigit, args[1]))
+    if len(query_phone) > 10:
+        query_phone = query_phone[-10:]
+
+    files = get_unique_session_files()
+    matched_file = None
+    for fpath in files:
+        if query_phone in os.path.basename(fpath):
+            matched_file = fpath
+            break
+
+    if matched_file:
+        bot.send_message(chat_id, f"📥 <i>Fetching session file for +91{esc(query_phone)}...</i>")
+        send_session_file(chat_id, matched_file)
+    else:
+        bot.reply_to(
+            message,
+            f"❌ No session JSON found for phone <code>+91{esc(query_phone)}</code>.\n"
+            "Use <code>/sessions</code> to see all available numbers."
+        )
+
+
+@bot.message_handler(commands=["last"])
+def cmd_last_session(message: types.Message):
+    chat_id = message.chat.id
+    files = get_unique_session_files()
+    if not files:
+        bot.reply_to(message, "📂 No session files found on the server yet.")
+        return
+
+    latest_file = files[0]
+    bot.send_message(chat_id, "📥 <i>Sending latest generated session JSON...</i>")
+    send_session_file(chat_id, latest_file)
+
+
+@bot.message_handler(commands=["downloadall", "zip"])
+def cmd_download_all_zip(message: types.Message):
+    chat_id = message.chat.id
+    files = get_unique_session_files()
+    if not files:
+        bot.reply_to(message, "📂 No session files found to package.")
+        return
+
+    msg = bot.reply_to(message, f"📦 <i>Packaging all {len(files)} session JSON files into ZIP...</i>")
+    zip_path = create_sessions_zip()
+
+    if zip_path and os.path.exists(zip_path):
+        size_kb = os.path.getsize(zip_path) / 1024
+        caption = (
+            f"📦 <b>All Meesho Session JSONs Backup</b>\n\n"
+            f"• <b>Total Accounts:</b> {len(files)} sessions\n"
+            f"• <b>Archive Size:</b> {size_kb:.1f} KB\n"
+            f"• <b>Generated At:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        )
+        with open(zip_path, "rb") as zf:
+            bot.send_document(chat_id, zf, caption=caption, visible_file_name="meesho_all_sessions.zip")
+        try:
+            bot.delete_message(chat_id, msg.message_id)
+        except Exception:
+            pass
+    else:
+        bot.edit_message_text("❌ Failed to create ZIP archive.", chat_id, msg.message_id)
 
 
 @bot.message_handler(commands=["cancel", "stop"])
@@ -371,30 +557,7 @@ def _run_account_creation_worker(chat_id: int, count: int, min_offer: int, ref_l
                         success_count += 1
                         current_num = success_count
 
-                    phone = acc_data.get("mobile") or acc_data.get("created_phone")
-                    user_id = acc_data.get("user_id")
-                    offer = acc_data.get("harvested_offer", {})
-                    offer_txt = offer.get("offer_text") or f"₹{offer.get('offer_value')} OFF"
-                    dev = acc_data.get("device_profile", {})
-                    dev_str = f"{dev.get('brand')} {dev.get('model')}"
-
-                    summary = (
-                        f"🎉 <b>[Success #{current_num}/{count}] Account Generated!</b>\n\n"
-                        f"📱 <b>Phone:</b> <code>+91{esc(phone)}</code>\n"
-                        f"🆔 <b>User ID:</b> <code>{esc(user_id)}</code>\n"
-                        f"🎁 <b>FOD Offer:</b> <b>{esc(offer_txt)}</b>\n"
-                        f"🔗 <b>Referral Code:</b> <code>{esc(ref_meta.get('via') or 'Organic')}</code>\n"
-                        f"📱 <b>Device Bound:</b> {esc(dev_str)}\n"
-                        f"📁 <b>Session File:</b> <code>{esc(os.path.basename(session_file))}</code>"
-                    )
-
-                    with open(session_file, "rb") as doc:
-                        bot.send_document(
-                            chat_id,
-                            doc,
-                            caption=summary,
-                            visible_file_name=os.path.basename(session_file)
-                        )
+                    send_session_file(chat_id, session_file)
                     break
                 else:
                     time.sleep(1)
@@ -410,7 +573,8 @@ def _run_account_creation_worker(chat_id: int, count: int, min_offer: int, ref_l
         if not settings.get("stop_requested") and success_count > 0:
             bot.send_message(
                 chat_id,
-                f"🏆 <b>All {success_count}/{count} Meesho Accounts & JSONs Successfully Delivered!</b>",
+                f"🏆 <b>All {success_count}/{count} Meesho Accounts & JSONs Successfully Delivered!</b>\n\n"
+                "<i>You can retrieve any file anytime with <code>/sessions</code> or <code>/get &lt;phone&gt;</code></i>",
                 reply_markup=build_main_keyboard()
             )
 
@@ -559,28 +723,7 @@ def handle_text_messages(message: types.Message):
             settings["manual_flow"] = None
 
             if acc_data and session_file and os.path.exists(session_file):
-                phone = acc_data.get("mobile")
-                user_id = acc_data.get("user_id")
-                offer = acc_data.get("harvested_offer", {})
-                offer_txt = offer.get("offer_text") or f"₹{offer.get('offer_value')} OFF"
-                ref_applied = acc_data.get("referral_applied", {})
-
-                summary = (
-                    f"🎉 <b>Manual Account Successfully Generated!</b>\n\n"
-                    f"📱 <b>Phone:</b> <code>+91{esc(phone)}</code>\n"
-                    f"🆔 <b>User ID:</b> <code>{esc(user_id)}</code>\n"
-                    f"🎁 <b>FOD Discount:</b> <b>{esc(offer_txt)}</b>\n"
-                    f"🔗 <b>Referral:</b> <code>{esc(ref_applied.get('via') or 'None')}</code>\n"
-                    f"📁 <b>Session File:</b> <code>{esc(os.path.basename(session_file))}</code>"
-                )
-
-                with open(session_file, "rb") as doc:
-                    bot.send_document(
-                        chat_id,
-                        doc,
-                        caption=summary,
-                        visible_file_name=os.path.basename(session_file)
-                    )
+                send_session_file(chat_id, session_file)
             else:
                 bot.edit_message_text(
                     f"❌ <b>OTP Verification Failed:</b> {esc(err or 'Incorrect OTP or session expired.')}\n"
@@ -594,7 +737,7 @@ def handle_text_messages(message: types.Message):
     else:
         bot.reply_to(
             message,
-            "💡 Type <code>/help</code> or use the menu below to start generating accounts.",
+            "💡 Type <code>/help</code> or use the menu below to start generating or downloading JSONs.",
             reply_markup=build_main_keyboard()
         )
 
@@ -662,28 +805,55 @@ def handle_callbacks(call: types.CallbackQuery):
         bot.send_message(chat_id, text)
 
     elif call.data == "cb_sessions":
-        bot.answer_callback_query(call.id)
-        files = sorted(
-            glob.glob("session_*_meesho.json") + glob.glob("session_*.json"),
-            key=os.path.getmtime,
-            reverse=True
-        )
-        seen = set()
-        unique = []
-        for f in files:
-            b = os.path.basename(f)
-            if b not in seen:
-                seen.add(b)
-                unique.append(f)
-
-        if not unique:
+        bot.answer_callback_query(call.id, "Loading sessions...")
+        files = get_unique_session_files()
+        if not files:
             bot.send_message(chat_id, "📂 No session files created yet.")
         else:
-            lines = [f"📁 <b>Recent Sessions ({len(unique)} total):</b>\n"]
-            for idx, fpath in enumerate(unique[:8], 1):
+            lines = [f"📁 <b>Available Meesho Session JSONs ({len(files)} total):</b>\n"]
+            for idx, fpath in enumerate(files[:10], 1):
                 fname = os.path.basename(fpath)
-                lines.append(f"{idx}. <code>{esc(fname)}</code>")
-            bot.send_message(chat_id, "\n".join(lines))
+                digits = "".join(filter(str.isdigit, fname))
+                phone_label = digits[-10:] if len(digits) >= 10 else fname
+                mtime = datetime.fromtimestamp(os.path.getmtime(fpath)).strftime("%d/%m %H:%M")
+                size_kb = os.path.getsize(fpath) / 1024
+                lines.append(f"{idx}. 📱 <b>+91{esc(phone_label)}</b> — {size_kb:.1f} KB ({mtime})")
+
+            lines.append("\n👉 <i>Tap any button below to download the JSON instantly:</i>")
+            bot.send_message(chat_id, "\n".join(lines), reply_markup=build_sessions_keyboard(files))
+
+    elif call.data == "cb_download_all_zip":
+        bot.answer_callback_query(call.id, "Creating ZIP archive...")
+        files = get_unique_session_files()
+        if not files:
+            bot.send_message(chat_id, "📂 No session files to package.")
+            return
+
+        zip_path = create_sessions_zip()
+        if zip_path and os.path.exists(zip_path):
+            size_kb = os.path.getsize(zip_path) / 1024
+            caption = (
+                f"📦 <b>All Meesho Session JSONs Backup</b>\n\n"
+                f"• <b>Total Accounts:</b> {len(files)} sessions\n"
+                f"• <b>Archive Size:</b> {size_kb:.1f} KB\n"
+                f"• <b>Generated At:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+            )
+            with open(zip_path, "rb") as zf:
+                bot.send_document(chat_id, zf, caption=caption, visible_file_name="meesho_all_sessions.zip")
+
+    elif call.data.startswith("cb_dl_"):
+        phone_target = call.data.replace("cb_dl_", "").strip()
+        bot.answer_callback_query(call.id, f"Sending +91{phone_target}...")
+        files = get_unique_session_files()
+        matched = None
+        for fpath in files:
+            if phone_target in os.path.basename(fpath):
+                matched = fpath
+                break
+        if matched:
+            send_session_file(chat_id, matched)
+        else:
+            bot.send_message(chat_id, f"❌ Session for +91{esc(phone_target)} not found.")
 
 
 # ─────────────────────────────────────────────────────────────
