@@ -255,15 +255,22 @@ def cmd_sessions(message: types.Message):
     bot.reply_to(message, "\n".join(lines))
 
 
-@bot.message_handler(commands=["cancel"])
+@bot.message_handler(commands=["cancel", "stop"])
 def cmd_cancel(message: types.Message):
     chat_id = message.chat.id
     settings = get_user_settings(chat_id)
+    cancelled = False
     if settings.get("manual_flow"):
         settings["manual_flow"] = None
-        bot.reply_to(message, "🛑 <b>Manual OTP flow has been cancelled.</b>", reply_markup=build_main_keyboard())
+        cancelled = True
+    if settings.get("is_generating"):
+        settings["stop_requested"] = True
+        cancelled = True
+
+    if cancelled:
+        bot.reply_to(message, "🛑 <b>Stopping active generation / flow...</b>", reply_markup=build_main_keyboard())
     else:
-        bot.reply_to(message, "ℹ️ No active manual flow to cancel.", reply_markup=build_main_keyboard())
+        bot.reply_to(message, "ℹ️ No active task to cancel.", reply_markup=build_main_keyboard())
 
 
 # ─────────────────────────────────────────────────────────────
@@ -274,15 +281,21 @@ def _run_account_creation_worker(chat_id: int, count: int, min_offer: int, ref_l
     with active_tasks_lock:
         active_tasks_count += 1
 
+    settings = get_user_settings(chat_id)
+    settings["stop_requested"] = False
+    settings["is_generating"] = True
+
     try:
         ref_meta = meesho_engine.parse_referral_link(ref_link)
         status_msg = bot.send_message(
             chat_id,
-            f"🚀 <b>Starting Automated Meesho Account Generation</b>\n\n"
+            f"🚀 <b>Starting Continuous Meesho Account Generation</b>\n\n"
             f"• <b>Target Accounts:</b> {count}\n"
             f"• <b>Min FOD Discount:</b> ≥ ₹{esc(min_offer)} OFF\n"
-            f"• <b>Referral Code:</b> <code>{esc(ref_meta.get('via') or 'None')}</code>\n\n"
-            f"⏳ <i>Searching active SMS providers and hunting devices...</i>"
+            f"• <b>Referral Code:</b> <code>{esc(ref_meta.get('via') or 'None')}</code>\n"
+            f"• <b>Mode:</b> <i>Continuous retry until JSON is generated ✅</i>\n\n"
+            f"⏳ <i>Searching active SMS providers and hunting devices...</i>\n"
+            f"<i>(Send <code>/stop</code> anytime to cancel)</i>"
         )
 
         providers = [p for p in meesho_engine.get_all_sms_providers() if p.api_key and p.get_balance() > 0]
@@ -298,14 +311,19 @@ def _run_account_creation_worker(chat_id: int, count: int, min_offer: int, ref_l
         success_count = 0
 
         for i in range(1, count + 1):
+            if settings.get("stop_requested"):
+                bot.send_message(chat_id, "🛑 <b>Generation stopped by user request.</b>", reply_markup=build_main_keyboard())
+                break
+
             def log_progress(text: str):
                 try:
                     bot.send_chat_action(chat_id, "typing")
                     bot.edit_message_text(
                         f"🚀 <b>Generating Account {i}/{count}</b>\n\n"
-                        f"• <b>Progress:</b> {esc(text)}\n"
-                        f"• <b>Referral:</b> <code>{esc(ref_meta.get('via') or 'None')}</code>\n"
-                        f"• <b>Target Offer:</b> ≥ ₹{esc(min_offer)}",
+                        f"• <b>Status:</b> {esc(text)}\n"
+                        f"• <b>Target Offer:</b> ≥ ₹{esc(min_offer)} OFF\n"
+                        f"• <b>Referral:</b> <code>{esc(ref_meta.get('via') or 'None')}</code>\n\n"
+                        f"<i>Retrying numbers automatically until JSON is delivered...</i>",
                         chat_id,
                         status_msg.message_id
                     )
@@ -316,8 +334,13 @@ def _run_account_creation_worker(chat_id: int, count: int, min_offer: int, ref_l
                 min_offer=min_offer,
                 ref_meta=ref_meta,
                 active_providers=providers,
-                log_cb=log_progress
+                log_cb=log_progress,
+                stop_check=lambda: settings.get("stop_requested", False)
             )
+
+            if settings.get("stop_requested"):
+                bot.send_message(chat_id, "🛑 <b>Generation stopped by user request.</b>", reply_markup=build_main_keyboard())
+                break
 
             if acc_data and session_file and os.path.exists(session_file):
                 success_count += 1
@@ -346,25 +369,27 @@ def _run_account_creation_worker(chat_id: int, count: int, min_offer: int, ref_l
                         visible_file_name=os.path.basename(session_file)
                     )
             else:
-                bot.send_message(
-                    chat_id,
-                    f"⚠️ <b>Account {i}/{count} Failed:</b> {esc(err or 'Unknown error')}. Continuing..."
-                )
+                if not settings.get("stop_requested"):
+                    bot.send_message(
+                        chat_id,
+                        f"⚠️ <b>Account {i}/{count} Note:</b> {esc(err or 'Retry stopped')}"
+                    )
 
             time.sleep(1)
 
-        bot.send_message(
-            chat_id,
-            f"🏆 <b>Account Generation Complete!</b>\n\n"
-            f"• <b>Successfully Created:</b> {success_count}/{count} accounts\n"
-            f"• <b>All JSON session files delivered above!</b>",
-            reply_markup=build_main_keyboard()
-        )
+        if not settings.get("stop_requested") and success_count > 0:
+            bot.send_message(
+                chat_id,
+                f"🏆 <b>All {success_count}/{count} Meesho Accounts & JSONs Successfully Delivered!</b>",
+                reply_markup=build_main_keyboard()
+            )
 
     except Exception as e:
         logger.exception("Error in account creation worker")
         bot.send_message(chat_id, f"❌ <b>Error occurred during execution:</b> {esc(str(e))}")
     finally:
+        settings["is_generating"] = False
+        settings["stop_requested"] = False
         with active_tasks_lock:
             active_tasks_count -= 1
 
