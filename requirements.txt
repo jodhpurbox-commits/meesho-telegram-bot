@@ -1,0 +1,6 @@
+pyTelegramBotAPI>=4.20.0
+requests>=2.31.0
+cryptography>=41.0.0
+flask>=3.0.0
+urllib3>=2.0.0
+werkzeug>=3.0.0
