@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 
+import requests
 from flask import Flask, jsonify
 import telebot
 from telebot import types
@@ -887,6 +888,22 @@ def handle_callbacks(call: types.CallbackQuery):
 # ─────────────────────────────────────────────────────────────
 # MAIN ENTRYPOINT
 # ─────────────────────────────────────────────────────────────
+def run_self_keepalive():
+    """Periodically pings the Render public URL every 4 minutes to guarantee 24/7 continuous uptime."""
+    time.sleep(15)
+    keepalive_urls = [
+        "https://meesho-tg-bot.onrender.com/health",
+        f"http://127.0.0.1:{config.PORT}/health"
+    ]
+    while True:
+        for u in keepalive_urls:
+            try:
+                requests.get(u, timeout=10)
+            except Exception:
+                pass
+        time.sleep(240)
+
+
 if __name__ == "__main__":
     logger.info("🚀 Starting Meesho Telegram Bot & Render Keep-Alive Service...")
 
@@ -900,6 +917,10 @@ if __name__ == "__main__":
     # Start Flask Web Server in background daemon thread
     flask_thread = threading.Thread(target=run_flask_server, daemon=True)
     flask_thread.start()
+
+    # Start Self-Keepalive thread to prevent free tier spin-down
+    keepalive_thread = threading.Thread(target=run_self_keepalive, daemon=True)
+    keepalive_thread.start()
 
     # Start Telegram Bot Polling with auto-reconnection
     while True:
