@@ -73,16 +73,84 @@ def run_flask_server():
 
 
 # ─────────────────────────────────────────────────────────────
-# HELPER FUNCTIONS & SESSION RETRIEVAL
+# ACCESS TRACKING & SECURITY MONITORING
 # ─────────────────────────────────────────────────────────────
-def is_authorized(chat_id: int, message: Optional[types.Message] = None) -> bool:
-    """Verifies that the user is authorized to use the bot."""
+ACCESS_HISTORY_FILE = "access_history.json"
+access_history_lock = threading.Lock()
+ADMIN_ALERT_ID = 1626878932
+
+
+def log_and_track_user(chat_id: int, message: Optional[types.Message] = None, call: Optional[types.CallbackQuery] = None, authorized: bool = True):
+    from_user = None
+    cmd_text = "N/A"
+    if message:
+        from_user = message.from_user
+        cmd_text = message.text or "Message"
+    elif call:
+        from_user = call.from_user
+        cmd_text = f"Button: {call.data}"
+
+    user_id = chat_id
+    username = from_user.username if from_user and from_user.username else ""
+    full_name = f"{from_user.first_name or ''} {from_user.last_name or ''}".strip() if from_user else "Unknown"
+
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    entry = {
+        "user_id": user_id,
+        "username": username,
+        "full_name": full_name,
+        "command": cmd_text,
+        "authorized": authorized,
+        "timestamp": now_str
+    }
+
+    with access_history_lock:
+        history = []
+        if os.path.exists(ACCESS_HISTORY_FILE):
+            try:
+                with open(ACCESS_HISTORY_FILE, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+            except Exception:
+                history = []
+        history.append(entry)
+        if len(history) > 300:
+            history = history[-300:]
+        try:
+            with open(ACCESS_HISTORY_FILE, "w", encoding="utf-8") as f:
+                json.dump(history, f, indent=2)
+        except Exception:
+            pass
+
+    # Send instant security alert to admin whenever an unauthorized user touches the bot
+    if not authorized:
+        try:
+            uname_str = f"@{username}" if username else "No username"
+            alert_text = (
+                "🚨 <b>Unauthorized Bot Access Alert!</b>\n\n"
+                f"• <b>User ID:</b> <code>{user_id}</code>\n"
+                f"• <b>Name:</b> {esc(full_name)}\n"
+                f"• <b>Username:</b> {esc(uname_str)}\n"
+                f"• <b>Action:</b> <code>{esc(cmd_text[:100])}</code>\n"
+                f"• <b>Time:</b> {now_str}\n\n"
+                "⛔ <i>User was blocked immediately.</i>"
+            )
+            bot.send_message(ADMIN_ALERT_ID, alert_text, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Failed to send admin intrusion alert: {e}")
+
+
+def is_authorized(chat_id: int, message: Optional[types.Message] = None, call: Optional[types.CallbackQuery] = None) -> bool:
+    """Verifies that the user is authorized to use the bot and tracks all access."""
     if not config.ALLOWED_USERS:
+        log_and_track_user(chat_id, message, call, authorized=True)
         return True
     if int(chat_id) in config.ALLOWED_USERS:
+        log_and_track_user(chat_id, message, call, authorized=True)
         return True
 
     logger.warning(f"Unauthorized access attempt from Telegram ID: {chat_id}")
+    log_and_track_user(chat_id, message, call, authorized=False)
     if message:
         try:
             bot.reply_to(
@@ -198,10 +266,12 @@ def build_main_keyboard() -> types.InlineKeyboardMarkup:
     b6 = types.InlineKeyboardButton("📁 Browse & Download JSONs", callback_data="cb_sessions")
     b7 = types.InlineKeyboardButton("📦 Download All (ZIP)", callback_data="cb_download_all_zip")
     b8 = types.InlineKeyboardButton("⚙️ Current Settings", callback_data="cb_settings")
+    b9 = types.InlineKeyboardButton("👥 View Bot Users / Audit", callback_data="cb_audit")
     markup.add(b1, b2)
     markup.add(b3, b4)
     markup.add(b5, b6)
     markup.add(b7, b8)
+    markup.add(b9)
     return markup
 
 
@@ -491,6 +561,58 @@ def cmd_download_all_zip(message: types.Message):
             pass
     else:
         bot.edit_message_text("❌ Failed to create ZIP archive.", chat_id, msg.message_id)
+
+
+@bot.message_handler(commands=["users", "audit"])
+def cmd_audit(message: types.Message):
+    chat_id = message.chat.id
+    if not is_authorized(chat_id, message):
+        return
+
+    with access_history_lock:
+        history = []
+        if os.path.exists(ACCESS_HISTORY_FILE):
+            try:
+                with open(ACCESS_HISTORY_FILE, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+            except Exception:
+                history = []
+
+    if not history:
+        bot.reply_to(message, "📋 <b>No access attempts recorded yet.</b>", parse_mode="HTML")
+        return
+
+    users_summary = {}
+    for h in history:
+        uid = h["user_id"]
+        if uid not in users_summary:
+            users_summary[uid] = {
+                "user_id": uid,
+                "username": h.get("username") or "",
+                "full_name": h.get("full_name") or "Unknown",
+                "authorized": h.get("authorized", False),
+                "count": 0,
+                "last_seen": h.get("timestamp"),
+                "last_cmd": h.get("command")
+            }
+        users_summary[uid]["count"] += 1
+        users_summary[uid]["last_seen"] = h.get("timestamp")
+        users_summary[uid]["last_cmd"] = h.get("command")
+
+    lines = ["👥 <b>Bot Access & Intrusion Audit Log:</b>\n"]
+    for uid, u in users_summary.items():
+        status_tag = "✅ Admin / Allowed" if u["authorized"] else "⛔ BLOCKED INTRUDER"
+        uname = f"@{u['username']}" if u['username'] else "No @username"
+        lines.append(
+            f"• <b>User ID:</b> <code>{uid}</code> [{status_tag}]\n"
+            f"  <b>Name:</b> {esc(u['full_name'])} ({esc(uname)})\n"
+            f"  <b>Interactions:</b> {u['count']} times\n"
+            f"  <b>Last Action:</b> <code>{esc(u['last_cmd'])}</code>\n"
+            f"  <b>Last Seen:</b> {esc(u['last_seen'])}\n"
+        )
+
+    lines.append("<i>All unauthorized users are blocked from executing commands or downloading JSONs.</i>")
+    bot.reply_to(message, "\n".join(lines), parse_mode="HTML")
 
 
 @bot.message_handler(commands=["cancel", "stop"])
@@ -936,6 +1058,10 @@ def handle_callbacks(call: types.CallbackQuery):
             send_session_file(chat_id, matched)
         else:
             bot.send_message(chat_id, f"❌ Session for +91{esc(phone_target)} not found.")
+
+    elif call.data == "cb_audit":
+        bot.answer_callback_query(call.id, "Loading user access logs...")
+        cmd_audit(call.message)
 
 
 # ─────────────────────────────────────────────────────────────
