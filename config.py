@@ -25,6 +25,10 @@ DEFAULT_MIN_OFFER = int(os.getenv("MIN_OFFER_DISCOUNT", "180"))
 # PORT for Render Web Service (to keep service alive 24/7)
 PORT = int(os.getenv("PORT", "10000"))
 
+# 🔒 PRIVATE ACCESS CONTROL (Only your Telegram ID can use the bot)
+ALLOWED_USERS_RAW = os.getenv("ALLOWED_USERS", "1626878932")
+ALLOWED_USERS = [int(x.strip()) for x in ALLOWED_USERS_RAW.split(",") if x.strip().isdigit()]
+
 # ─────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────
