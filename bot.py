@@ -75,6 +75,28 @@ def run_flask_server():
 # ─────────────────────────────────────────────────────────────
 # HELPER FUNCTIONS & SESSION RETRIEVAL
 # ─────────────────────────────────────────────────────────────
+def is_authorized(chat_id: int, message: Optional[types.Message] = None) -> bool:
+    """Verifies that the user is authorized to use the bot."""
+    if not config.ALLOWED_USERS:
+        return True
+    if int(chat_id) in config.ALLOWED_USERS:
+        return True
+
+    logger.warning(f"Unauthorized access attempt from Telegram ID: {chat_id}")
+    if message:
+        try:
+            bot.reply_to(
+                message,
+                f"⛔ <b>Access Restricted</b>\n\n"
+                f"Your Telegram ID: <code>{chat_id}</code>\n"
+                f"This bot is private and accessible only to authorized administrators.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+    return False
+
+
 def get_user_settings(chat_id: int) -> Dict[str, Any]:
     if chat_id not in user_states:
         user_states[chat_id] = {
@@ -211,6 +233,8 @@ def build_sessions_keyboard(files: List[str]) -> types.InlineKeyboardMarkup:
 @bot.message_handler(commands=["start", "help"])
 def cmd_start_help(message: types.Message):
     chat_id = message.chat.id
+    if not is_authorized(chat_id, message):
+        return
     logger.info(f"Received /start or /help from user {chat_id} (@{message.from_user.username})")
     settings = get_user_settings(chat_id)
     ref_info = meesho_engine.parse_referral_link(settings["referral"])
@@ -246,6 +270,8 @@ def cmd_start_help(message: types.Message):
 @bot.message_handler(commands=["status"])
 def cmd_status(message: types.Message):
     chat_id = message.chat.id
+    if not is_authorized(chat_id, message):
+        return
     logger.info(f"Received /status from user {chat_id}")
     uptime_sec = int(time.time() - bot_start_time)
     hours, rem = divmod(uptime_sec, 3600)
@@ -270,6 +296,8 @@ def cmd_status(message: types.Message):
 @bot.message_handler(commands=["balance"])
 def cmd_balance(message: types.Message):
     chat_id = message.chat.id
+    if not is_authorized(chat_id, message):
+        return
     logger.info(f"Received /balance from user {chat_id}")
     msg = bot.reply_to(message, "📡 <i>Querying SMS provider balances...</i>")
 
@@ -303,6 +331,8 @@ def cmd_balance(message: types.Message):
 @bot.message_handler(commands=["referral"])
 def cmd_referral(message: types.Message):
     chat_id = message.chat.id
+    if not is_authorized(chat_id, message):
+        return
     settings = get_user_settings(chat_id)
     args = message.text.split(maxsplit=1)
 
@@ -330,6 +360,8 @@ def cmd_referral(message: types.Message):
 @bot.message_handler(commands=["minoffer"])
 def cmd_minoffer(message: types.Message):
     chat_id = message.chat.id
+    if not is_authorized(chat_id, message):
+        return
     settings = get_user_settings(chat_id)
     args = message.text.split(maxsplit=1)
 
@@ -351,6 +383,8 @@ def cmd_minoffer(message: types.Message):
 @bot.message_handler(commands=["sessions"])
 def cmd_sessions(message: types.Message):
     chat_id = message.chat.id
+    if not is_authorized(chat_id, message):
+        return
     files = get_unique_session_files()
 
     if not files:
@@ -373,6 +407,8 @@ def cmd_sessions(message: types.Message):
 @bot.message_handler(commands=["get", "download", "json"])
 def cmd_get_session(message: types.Message):
     chat_id = message.chat.id
+    if not is_authorized(chat_id, message):
+        return
     args = message.text.split(maxsplit=1)
 
     if len(args) < 2:
@@ -414,6 +450,8 @@ def cmd_get_session(message: types.Message):
 @bot.message_handler(commands=["last"])
 def cmd_last_session(message: types.Message):
     chat_id = message.chat.id
+    if not is_authorized(chat_id, message):
+        return
     files = get_unique_session_files()
     if not files:
         bot.reply_to(message, "📂 No session files found on the server yet.")
@@ -427,6 +465,8 @@ def cmd_last_session(message: types.Message):
 @bot.message_handler(commands=["downloadall", "zip"])
 def cmd_download_all_zip(message: types.Message):
     chat_id = message.chat.id
+    if not is_authorized(chat_id, message):
+        return
     files = get_unique_session_files()
     if not files:
         bot.reply_to(message, "📂 No session files found to package.")
@@ -456,6 +496,8 @@ def cmd_download_all_zip(message: types.Message):
 @bot.message_handler(commands=["cancel", "stop"])
 def cmd_cancel(message: types.Message):
     chat_id = message.chat.id
+    if not is_authorized(chat_id, message):
+        return
     settings = get_user_settings(chat_id)
     cancelled = False
     if settings.get("manual_flow"):
@@ -602,6 +644,8 @@ def _run_account_creation_worker(chat_id: int, count: int, min_offer: int, ref_l
 @bot.message_handler(commands=["create"])
 def cmd_create(message: types.Message):
     chat_id = message.chat.id
+    if not is_authorized(chat_id, message):
+        return
     settings = get_user_settings(chat_id)
     args = message.text.split()[1:]
 
@@ -692,6 +736,8 @@ def start_manual_otp_flow(chat_id: int, phone: str):
 @bot.message_handler(commands=["manual"])
 def cmd_manual(message: types.Message):
     chat_id = message.chat.id
+    if not is_authorized(chat_id, message):
+        return
     args = message.text.split(maxsplit=1)
 
     if len(args) > 1:
@@ -708,6 +754,8 @@ def cmd_manual(message: types.Message):
 def _handle_manual_phone_input(message: types.Message):
     if message.text.startswith("/"):
         return
+    if not is_authorized(message.chat.id, message):
+        return
     phone = message.text.strip()
     start_manual_otp_flow(message.chat.id, phone)
 
@@ -715,6 +763,8 @@ def _handle_manual_phone_input(message: types.Message):
 @bot.message_handler(func=lambda msg: msg.text and not msg.text.startswith("/"))
 def handle_text_messages(message: types.Message):
     chat_id = message.chat.id
+    if not is_authorized(chat_id, message):
+        return
     settings = get_user_settings(chat_id)
     manual_data = settings.get("manual_flow")
 
@@ -759,6 +809,9 @@ def handle_text_messages(message: types.Message):
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call: types.CallbackQuery):
     chat_id = call.message.chat.id
+    if not is_authorized(chat_id):
+        bot.answer_callback_query(call.id, f"⛔ Access Restricted! (ID: {chat_id})", show_alert=True)
+        return
     settings = get_user_settings(chat_id)
 
     if call.data == "cb_create_1":
